@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-HLS Restream Proxy v3 - Railway Edition
+HLS Restream Proxy v4 - Railway Edition
 - Cloudflare bypass (curl_cffi)
+- Dinamik JS player için Playwright
+- Alt playlist (chunklist) rewrite
 - Sabit /channel/<slug> URL
-- Arka planda token yenilemem
-- Unicode-safe hatalar
+- Arka planda token yenileme
 """
 
 import os
@@ -26,10 +27,18 @@ except ImportError:
     HAS_CFFI = False
     print("[!] curl_cffi yuklu degil, urllib kullanilacak")
 
+# Playwright (dinamik JS için)
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    print("[!] playwright yuklu degil, JS player calismayabilir")
+
 # ============ AYARLAR ============
 PORT = int(os.environ.get("PORT", 8080))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", 3600))          # 1 saat
-REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", 14400))  # 4 saat
+CACHE_TTL = int(os.environ.get("CACHE_TTL", 3600))
+REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", 14400))
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 
 CHANNELS = {}
@@ -82,7 +91,6 @@ def fetch_url(url, referer=None, timeout=20, extra_headers=None):
     if extra_headers:
         headers.update(extra_headers)
 
-    # Önce curl_cffi dene (Cloudflare bypass)
     if HAS_CFFI:
         try:
             session = cffi_requests.Session(impersonate="chrome124")
@@ -91,7 +99,6 @@ def fetch_url(url, referer=None, timeout=20, extra_headers=None):
         except Exception as e:
             print(f"[!] curl_cffi hatasi ({url[:80]}): {e}")
 
-    # Fallback: urllib
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -128,11 +135,9 @@ def extract_m3u8_from_html(html):
     return None
 
 def extract_iframes(html):
-    """Tüm iframe src'lerini döndür (reklam olanları atla)"""
     if not html:
         return []
     iframes = re.findall(r'<iframe[^>]*src\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    # reklam iframe'lerini filtrele
     skip = ["ad.html", "ads.", "doubleclick", "googlesyndication", "adservice"]
     result = []
     for src in iframes:
@@ -142,6 +147,59 @@ def extract_iframes(html):
         result.append(src)
     return result
 
+# ============ PLAYWRIGHT İLE M3U8 YAKALAMA ============
+def resolve_m3u8_with_playwright(channel):
+    """Gerçek tarayıcı ile JS player'dan m3u8 yakala"""
+    if not HAS_PLAYWRIGHT:
+        return None
+
+    source_url = channel["source_url"]
+    referer = channel["referer"] or source_url
+    captured = {"m3u8": None}
+
+    def handle_response(response):
+        try:
+            url = response.url
+            if ".m3u8" in url and captured["m3u8"] is None:
+                captured["m3u8"] = url
+                print(f"[+] Playwright m3u8 yakaladi: {url[:150]}")
+        except Exception:
+            pass
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ]
+            )
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            page = context.new_page()
+            page.on("response", handle_response)
+
+            print(f"[*] Playwright sayfa aciliyor: {source_url}")
+            page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+
+            # m3u8 yakalanana kadar bekle (max 15 sn)
+            for _ in range(15):
+                if captured["m3u8"]:
+                    break
+                page.wait_for_timeout(1000)
+
+            browser.close()
+    except Exception as e:
+        print(f"[!] Playwright hatasi: {e}")
+
+    return captured["m3u8"]
+
 # ============ M3U8 ÇÖZÜMLEME ============
 def resolve_m3u8(channel):
     source_url = channel["source_url"]
@@ -149,50 +207,37 @@ def resolve_m3u8(channel):
 
     print(f"[*] {channel['name']} icin m3u8 cozumleniyor: {source_url}")
 
+    # 1) Önce curl_cffi ile dene (hızlı yol)
     html = fetch_url(source_url, referer=referer)
-    if not html:
-        print(f"[!] Kaynak sayfa alinamadi")
-        return None
+    if html:
+        print(f"[DEBUG] HTML uzunluk: {len(html)}")
 
-    print(f"[DEBUG] HTML uzunluk: {len(html)}")
-    print(f"[DEBUG] HTML ilk 2000: {html[:2000]!r}")
-
-    # 1) Doğrudan m3u8
-    m3u8 = extract_m3u8_from_html(html)
-    if m3u8:
-        print(f"[+] m3u8 bulundu: {m3u8[:120]}")
-        return m3u8
-
-    # 2) iframe'leri dene (reklam hariç)
-    iframes = extract_iframes(html)
-    print(f"[*] Bulunan iframe sayisi (reklam haric): {len(iframes)}")
-
-    for iframe_src in iframes:
-        if not iframe_src.startswith("http"):
-            iframe_src = urllib.parse.urljoin(source_url, iframe_src)
-        print(f"[*] iframe deneniyor: {iframe_src}")
-
-        iframe_html = fetch_url(iframe_src, referer=source_url)
-        if not iframe_html:
-            continue
-
-        m3u8 = extract_m3u8_from_html(iframe_html)
+        # Doğrudan m3u8
+        m3u8 = extract_m3u8_from_html(html)
         if m3u8:
-            print(f"[+] iframe icinde m3u8: {m3u8[:120]}")
+            print(f"[+] m3u8 bulundu (curl): {m3u8[:120]}")
             return m3u8
 
-        # Nested iframe
-        inner_iframes = extract_iframes(iframe_html)
-        for inner_src in inner_iframes:
-            if not inner_src.startswith("http"):
-                inner_src = urllib.parse.urljoin(iframe_src, inner_src)
-            print(f"[*] nested iframe: {inner_src}")
-            inner_html = fetch_url(inner_src, referer=iframe_src)
-            if inner_html:
-                m3u8 = extract_m3u8_from_html(inner_html)
+        # iframe'leri dene
+        iframes = extract_iframes(html)
+        print(f"[*] Bulunan iframe sayisi (reklam haric): {len(iframes)}")
+
+        for iframe_src in iframes:
+            if not iframe_src.startswith("http"):
+                iframe_src = urllib.parse.urljoin(source_url, iframe_src)
+            print(f"[*] iframe deneniyor: {iframe_src}")
+            iframe_html = fetch_url(iframe_src, referer=source_url)
+            if iframe_html:
+                m3u8 = extract_m3u8_from_html(iframe_html)
                 if m3u8:
-                    print(f"[+] nested iframe icinde m3u8: {m3u8[:120]}")
+                    print(f"[+] iframe icinde m3u8: {m3u8[:120]}")
                     return m3u8
+
+    # 2) Playwright ile dene (JS player için)
+    print(f"[*] curl ile bulunamadi, Playwright deneniyor: {channel['name']}")
+    m3u8 = resolve_m3u8_with_playwright(channel)
+    if m3u8:
+        return m3u8
 
     print(f"[!] m3u8 bulunamadi: {channel['name']}")
     return None
@@ -207,7 +252,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _send_error_safe(self, code, message):
-        """Unicode-safe hata"""
         try:
             self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -215,6 +259,37 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(message.encode("utf-8"))
         except Exception:
             pass
+
+    def _fetch_binary(self, url, referer=None, timeout=20):
+        """Binary içerik çek (segment veya alt playlist)"""
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        }
+        if referer:
+            headers["Referer"] = referer
+            try:
+                p = urllib.parse.urlparse(referer)
+                headers["Origin"] = f"{p.scheme}://{p.netloc}"
+            except Exception:
+                pass
+
+        if HAS_CFFI:
+            try:
+                session = cffi_requests.Session(impersonate="chrome124")
+                r = session.get(url, headers=headers, timeout=timeout)
+                return r.content, r.headers.get("Content-Type", "application/octet-stream")
+            except Exception as e:
+                print(f"[!] cffi binary hatasi: {e}")
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read(), resp.headers.get("Content-Type", "application/octet-stream")
+        except Exception as e:
+            print(f"[!] urllib binary hatasi: {e}")
+            return None, None
 
     def do_GET(self):
         try:
@@ -279,7 +354,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
 
-        # ---------- /segment ----------
+        # ---------- /segment (segment veya alt playlist) ----------
         elif path == "/segment":
             query = urllib.parse.parse_qs(parsed.query)
             seg_url = query.get("url", [None])[0]
@@ -293,49 +368,41 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error_safe(400, "url parametresi eksik")
                 return
 
-            try:
-                headers = {
-                    "User-Agent": USER_AGENT,
-                    "Accept": "*/*",
-                    "Accept-Encoding": "identity",
-                }
-                if ref:
-                    headers["Referer"] = ref
-                    try:
-                        p = urllib.parse.urlparse(ref)
-                        headers["Origin"] = f"{p.scheme}://{p.netloc}"
-                    except Exception:
-                        pass
-
-                seg_data = None
-                content_type = "video/mp2t"
-
-                if HAS_CFFI:
-                    try:
-                        session = cffi_requests.Session(impersonate="chrome124")
-                        r = session.get(seg_url, headers=headers, timeout=20)
-                        seg_data = r.content
-                        content_type = r.headers.get("Content-Type", content_type)
-                    except Exception as e:
-                        print(f"[!] cffi segment hatasi: {e}")
-
-                if seg_data is None:
-                    req = urllib.request.Request(seg_url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=20) as resp:
-                        seg_data = resp.read()
-                        content_type = resp.headers.get("Content-Type", content_type)
-
-            except Exception as e:
-                print(f"[!] segment hatasi: {e}")
+            data, content_type = self._fetch_binary(seg_url, referer=ref)
+            if data is None:
                 self._send_error_safe(502, "Segment alinamadi")
                 return
 
+            # Eğer içerik m3u8 playlist ise (alt playlist / chunklist), rewrite et
+            is_m3u8 = (
+                "mpegurl" in (content_type or "").lower()
+                or seg_url.split("?")[0].endswith(".m3u8")
+            )
+
+            if is_m3u8:
+                text = data.decode("utf-8", errors="ignore")
+                base_url = seg_url.rsplit("/", 1)[0]
+                ref_enc = urllib.parse.quote(ref or "", safe="")
+                lines = text.split("\n")
+                rewritten = []
+                for line in lines:
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        if not s.startswith("http"):
+                            s = f"{base_url}/{s}"
+                        proxy_seg = f"/segment?url={urllib.parse.quote(s, safe='')}&ref={ref_enc}"
+                        rewritten.append(proxy_seg)
+                    else:
+                        rewritten.append(line)
+                data = "\n".join(rewritten).encode("utf-8")
+                content_type = "application/vnd.apple.mpegurl"
+
             self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(seg_data)))
+            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(seg_data)
+            self.wfile.write(data)
 
         # ---------- /health ----------
         elif path == "/health":
@@ -391,7 +458,7 @@ def background_refresher():
 # ============ MAIN ============
 def main():
     print("=" * 60)
-    print("  HLS Restream Proxy v3 - Railway")
+    print("  HLS Restream Proxy v4 - Railway")
     print("=" * 60)
 
     load_channels()
