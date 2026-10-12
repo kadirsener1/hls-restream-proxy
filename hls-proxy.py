@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-HLS Restream Proxy v4 - Railway Edition
+HLS Restream Proxy v5 - Railway Edition
 - Cloudflare bypass (curl_cffi)
-- Dinamik JS player için Playwright
+- Dinamik JS player için Playwright (reklam engelleme + genişletilmiş bekleme)
 - Alt playlist (chunklist) rewrite
+- Range başlığı iletimi
 - Sabit /channel/<slug> URL
 - Arka planda token yenileme
 """
@@ -160,6 +161,9 @@ def resolve_m3u8_with_playwright(channel):
     def handle_response(response):
         try:
             url = response.url
+            # Tüm ilgili istekleri logla (debug)
+            if any(ext in url for ext in [".m3u8", ".mpd", ".ts", "playlist", "manifest"]):
+                print(f"[PW-NET] {response.status} {url[:150]}")
             if ".m3u8" in url and captured["m3u8"] is None:
                 captured["m3u8"] = url
                 print(f"[+] Playwright m3u8 yakaladi: {url[:150]}")
@@ -182,14 +186,25 @@ def resolve_m3u8_with_playwright(channel):
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
             )
+
+            # Reklamları engelle
+            ad_domains = [
+                "wpnxiswpuyrfn.icu", "vbcojhroxkoaf.online",
+                "doubleclick", "googlesyndication", "adsystem",
+                "adservice", "ads.", "ad.html"
+            ]
+            context.route("**/*", lambda route: route.abort()
+                if any(ad in route.request.url for ad in ad_domains)
+                else route.continue_())
+
             page = context.new_page()
             page.on("response", handle_response)
 
             print(f"[*] Playwright sayfa aciliyor: {source_url}")
-            page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(source_url, wait_until="load", timeout=60000)
 
-            # m3u8 yakalanana kadar bekle (max 15 sn)
-            for _ in range(15):
+            # m3u8 yakalanana kadar bekle (max 30 sn)
+            for i in range(30):
                 if captured["m3u8"]:
                     break
                 page.wait_for_timeout(1000)
@@ -212,13 +227,11 @@ def resolve_m3u8(channel):
     if html:
         print(f"[DEBUG] HTML uzunluk: {len(html)}")
 
-        # Doğrudan m3u8
         m3u8 = extract_m3u8_from_html(html)
         if m3u8:
             print(f"[+] m3u8 bulundu (curl): {m3u8[:120]}")
             return m3u8
 
-        # iframe'leri dene
         iframes = extract_iframes(html)
         print(f"[*] Bulunan iframe sayisi (reklam haric): {len(iframes)}")
 
@@ -260,7 +273,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _fetch_binary(self, url, referer=None, timeout=20):
+    def _fetch_binary(self, url, referer=None, timeout=20, range_header=None):
         """Binary içerik çek (segment veya alt playlist)"""
         headers = {
             "User-Agent": USER_AGENT,
@@ -274,22 +287,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 headers["Origin"] = f"{p.scheme}://{p.netloc}"
             except Exception:
                 pass
+        if range_header:
+            headers["Range"] = range_header
 
         if HAS_CFFI:
             try:
                 session = cffi_requests.Session(impersonate="chrome124")
                 r = session.get(url, headers=headers, timeout=timeout)
-                return r.content, r.headers.get("Content-Type", "application/octet-stream")
+                return r.content, r.headers.get("Content-Type", "application/octet-stream"), r.status_code
             except Exception as e:
                 print(f"[!] cffi binary hatasi: {e}")
 
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read(), resp.headers.get("Content-Type", "application/octet-stream")
+                return resp.read(), resp.headers.get("Content-Type", "application/octet-stream"), resp.status
         except Exception as e:
             print(f"[!] urllib binary hatasi: {e}")
-            return None, None
+            return None, None, None
 
     def do_GET(self):
         try:
@@ -368,12 +383,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error_safe(400, "url parametresi eksik")
                 return
 
-            data, content_type = self._fetch_binary(seg_url, referer=ref)
+            # Tivimate'ten gelen Range başlığını al
+            range_header = self.headers.get("Range")
+
+            # DEBUG log
+            print(f"[SEG] {seg_url[:100]} | Range: {range_header} | Ref: {ref}")
+
+            data, content_type, status_code = self._fetch_binary(
+                seg_url, referer=ref, range_header=range_header
+            )
             if data is None:
                 self._send_error_safe(502, "Segment alinamadi")
                 return
 
-            # Eğer içerik m3u8 playlist ise (alt playlist / chunklist), rewrite et
+            # Alt playlist (chunklist) ise rewrite et
             is_m3u8 = (
                 "mpegurl" in (content_type or "").lower()
                 or seg_url.split("?")[0].endswith(".m3u8")
@@ -397,9 +420,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 data = "\n".join(rewritten).encode("utf-8")
                 content_type = "application/vnd.apple.mpegurl"
 
-            self.send_response(200)
+            # Yanıt gönder (Range varsa 206)
+            resp_status = 206 if range_header else (status_code if status_code and status_code < 400 else 200)
+            self.send_response(resp_status)
             self.send_header("Content-Type", content_type or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Accept-Ranges", "bytes")
+            if range_header:
+                self.send_header("Content-Range", f"bytes 0-{len(data)-1}/{len(data)}")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
@@ -458,7 +486,7 @@ def background_refresher():
 # ============ MAIN ============
 def main():
     print("=" * 60)
-    print("  HLS Restream Proxy v4 - Railway")
+    print("  HLS Restream Proxy v5 - Railway")
     print("=" * 60)
 
     load_channels()
