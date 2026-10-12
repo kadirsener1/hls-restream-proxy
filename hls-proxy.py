@@ -3,7 +3,7 @@
 HLS Restream Proxy v3 - Railway Edition
 - Cloudflare bypass (curl_cffi)
 - Sabit /channel/<slug> URL
-- Arka planda token yenileme
+- Arka planda token yenilemem
 - Unicode-safe hatalar
 """
 
