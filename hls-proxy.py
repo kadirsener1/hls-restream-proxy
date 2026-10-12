@@ -155,6 +155,7 @@ def resolve_m3u8(channel):
         return None
 
     print(f"[DEBUG] HTML uzunluk: {len(html)}")
+    print(f"[DEBUG] HTML ilk 2000: {html[:2000]!r}")
 
     # 1) Doğrudan m3u8
     m3u8 = extract_m3u8_from_html(html)
