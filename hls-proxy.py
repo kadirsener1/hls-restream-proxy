@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-HLS Restream Proxy - Railway Edition (v2)
+HLS Restream Proxy v3 - Railway Edition
+- Cloudflare bypass (curl_cffi)
+- Sabit /channel/<slug> URL
+- Arka planda token yenileme
+- Unicode-safe hatalar
 """
 
 import os
@@ -14,11 +18,18 @@ import http.server
 import socketserver
 from datetime import datetime
 
+# Cloudflare bypass
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+    print("[!] curl_cffi yuklu degil, urllib kullanilacak")
+
 # ============ AYARLAR ============
 PORT = int(os.environ.get("PORT", 8080))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", 3600))
-REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", 14400))
-
+CACHE_TTL = int(os.environ.get("CACHE_TTL", 3600))          # 1 saat
+REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", 14400))  # 4 saat
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 
 CHANNELS = {}
@@ -53,8 +64,8 @@ def load_channels():
             }
     print(f"[+] {len(CHANNELS)} kanal yuklendi.")
 
-# ============ HTTP GET ============
-def fetch_url(url, referer=None, timeout=15, extra_headers=None):
+# ============ HTTP GET (Cloudflare bypass) ============
+def fetch_url(url, referer=None, timeout=20, extra_headers=None):
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
@@ -71,27 +82,36 @@ def fetch_url(url, referer=None, timeout=15, extra_headers=None):
     if extra_headers:
         headers.update(extra_headers)
 
-    req = urllib.request.Request(url, headers=headers)
+    # Önce curl_cffi dene (Cloudflare bypass)
+    if HAS_CFFI:
+        try:
+            session = cffi_requests.Session(impersonate="chrome124")
+            resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            return resp.text
+        except Exception as e:
+            print(f"[!] curl_cffi hatasi ({url[:80]}): {e}")
+
+    # Fallback: urllib
     try:
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            return data.decode("utf-8", errors="ignore")
+            return resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        print(f"[!] fetch_url hatasi ({url[:80]}): {e}")
+        print(f"[!] urllib hatasi ({url[:80]}): {e}")
         return None
 
-# ============ M3U8 ÇIKARMA (GENİŞLETİLMİŞ) ============
+# ============ M3U8 ÇIKARMA ============
 def extract_m3u8_from_html(html):
     if not html:
         return None
 
-    # Yorumları temizle
     html_clean = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
 
     patterns = [
         r'''file\s*:\s*["']([^"']+\.m3u8[^"']*)["']''',
         r'''source\s*:\s*["']([^"']+\.m3u8[^"']*)["']''',
         r'''src\s*:\s*["']([^"']+\.m3u8[^"']*)["']''',
+        r'''url\s*:\s*["']([^"']+\.m3u8[^"']*)["']''',
         r'''["'](https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)["']''',
         r'''(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)''',
         r'''["'](//[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)["']''',
@@ -107,39 +127,44 @@ def extract_m3u8_from_html(html):
                 return url
     return None
 
-def extract_all_scripts(html):
-    """HTML içindeki tüm script src ve inline script'leri döndür"""
-    scripts = []
-    for m in re.finditer(r'<script[^>]*src\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE):
-        scripts.append(m.group(1))
-    return scripts
+def extract_iframes(html):
+    """Tüm iframe src'lerini döndür (reklam olanları atla)"""
+    if not html:
+        return []
+    iframes = re.findall(r'<iframe[^>]*src\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+    # reklam iframe'lerini filtrele
+    skip = ["ad.html", "ads.", "doubleclick", "googlesyndication", "adservice"]
+    result = []
+    for src in iframes:
+        if any(s in src.lower() for s in skip):
+            print(f"[*] Reklam iframe atlandi: {src[:80]}")
+            continue
+        result.append(src)
+    return result
 
 # ============ M3U8 ÇÖZÜMLEME ============
 def resolve_m3u8(channel):
     source_url = channel["source_url"]
-    referer = channel["referer"]
-    mode = channel["mode"]
+    referer = channel["referer"] or source_url
 
     print(f"[*] {channel['name']} icin m3u8 cozumleniyor: {source_url}")
 
-    html = fetch_url(source_url, referer=referer or source_url)
+    html = fetch_url(source_url, referer=referer)
     if not html:
         print(f"[!] Kaynak sayfa alinamadi")
         return None
 
-    # DEBUG: HTML'in ilk 2000 karakterini logla
     print(f"[DEBUG] HTML uzunluk: {len(html)}")
-    print(f"[DEBUG] HTML ilk 500: {html[:500]!r}")
 
-    # 1) Doğrudan m3u8 ara
+    # 1) Doğrudan m3u8
     m3u8 = extract_m3u8_from_html(html)
     if m3u8:
         print(f"[+] m3u8 bulundu: {m3u8[:120]}")
         return m3u8
 
-    # 2) iframe'leri bul (hepsini dene, sadece ad.html değil)
-    iframes = re.findall(r'<iframe[^>]*src\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    print(f"[*] Bulunan iframe sayisi: {len(iframes)}")
+    # 2) iframe'leri dene (reklam hariç)
+    iframes = extract_iframes(html)
+    print(f"[*] Bulunan iframe sayisi (reklam haric): {len(iframes)}")
 
     for iframe_src in iframes:
         if not iframe_src.startswith("http"):
@@ -155,8 +180,8 @@ def resolve_m3u8(channel):
             print(f"[+] iframe icinde m3u8: {m3u8[:120]}")
             return m3u8
 
-        # iframe içindeki iframe'leri de dene (nested)
-        inner_iframes = re.findall(r'<iframe[^>]*src\s*=\s*["\']([^"\']+)["\']', iframe_html, re.IGNORECASE)
+        # Nested iframe
+        inner_iframes = extract_iframes(iframe_html)
         for inner_src in inner_iframes:
             if not inner_src.startswith("http"):
                 inner_src = urllib.parse.urljoin(iframe_src, inner_src)
@@ -181,7 +206,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _send_error_safe(self, code, message):
-        """Unicode-safe hata gönder"""
+        """Unicode-safe hata"""
         try:
             self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -198,10 +223,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._send_error_safe(400, "Bad request")
             return
 
+        # ---------- /channel/<slug> ----------
         if path.startswith("/channel/"):
-            slug = path[len("/channel/"):].strip("/")
-            # URL decode et
-            slug = urllib.parse.unquote(slug)
+            slug = urllib.parse.unquote(path[len("/channel/"):].strip("/"))
 
             if slug not in CHANNELS:
                 self._send_error_safe(404, f"Kanal bulunamadi: {slug}")
@@ -226,7 +250,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error_safe(503, "Yayin su anda alinamiyor")
                 return
 
-            # m3u8 içeriğini çek
             m3u8_content = fetch_url(m3u8_url, referer=channel.get("referer") or channel["source_url"])
             if not m3u8_content:
                 self._send_error_safe(502, "Upstream m3u8 alinamadi")
@@ -255,20 +278,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
 
+        # ---------- /segment ----------
         elif path == "/segment":
             query = urllib.parse.parse_qs(parsed.query)
             seg_url = query.get("url", [None])[0]
             ref = query.get("ref", [None])[0]
             if ref:
                 ref = urllib.parse.unquote(ref)
+            if seg_url:
+                seg_url = urllib.parse.unquote(seg_url)
 
             if not seg_url:
                 self._send_error_safe(400, "url parametresi eksik")
                 return
 
-            seg_url = urllib.parse.unquote(seg_url)
-
-            # Segment binary olabilir - byte olarak çek
             try:
                 headers = {
                     "User-Agent": USER_AGENT,
@@ -283,10 +306,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
-                req = urllib.request.Request(seg_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    seg_data = resp.read()
-                    content_type = resp.headers.get("Content-Type", "video/mp2t")
+                seg_data = None
+                content_type = "video/mp2t"
+
+                if HAS_CFFI:
+                    try:
+                        session = cffi_requests.Session(impersonate="chrome124")
+                        r = session.get(seg_url, headers=headers, timeout=20)
+                        seg_data = r.content
+                        content_type = r.headers.get("Content-Type", content_type)
+                    except Exception as e:
+                        print(f"[!] cffi segment hatasi: {e}")
+
+                if seg_data is None:
+                    req = urllib.request.Request(seg_url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        seg_data = resp.read()
+                        content_type = resp.headers.get("Content-Type", content_type)
+
             except Exception as e:
                 print(f"[!] segment hatasi: {e}")
                 self._send_error_safe(502, "Segment alinamadi")
@@ -299,6 +336,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(seg_data)
 
+        # ---------- /health ----------
         elif path == "/health":
             body = json.dumps({
                 "status": "ok",
@@ -311,13 +349,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        # ---------- / veya /playlist.m3u ----------
         elif path == "/" or path == "/playlist.m3u":
-            # Basit M3U playlist sun
             host = self.headers.get("Host", "localhost")
             scheme = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
             lines = ["#EXTM3U"]
             for slug, ch in CHANNELS.items():
-                lines.append(f'#EXTINF:-1 tvg-id="{slug}" tvg-name="{ch["name"]}" tvg-logo="{ch["logo"]}" group-title="{ch["group"]}",{ch["name"]}')
+                lines.append(
+                    f'#EXTINF:-1 tvg-id="{slug}" tvg-name="{ch["name"]}" '
+                    f'tvg-logo="{ch["logo"]}" group-title="{ch["group"]}",{ch["name"]}'
+                )
                 lines.append(f'{scheme}://{host}/channel/{slug}')
             body = "\n".join(lines).encode("utf-8")
             self.send_response(200)
@@ -341,13 +382,15 @@ def background_refresher():
                     channel["m3u8_url"] = m3u8_url
                     channel["last_refresh"] = datetime.now()
                     print(f"[OK] {channel['name']} yenilendi")
+                else:
+                    print(f"[!] {channel['name']} yenilenemedi")
             except Exception as e:
                 print(f"[!] {channel['name']} hata: {e}")
 
 # ============ MAIN ============
 def main():
     print("=" * 60)
-    print("  HLS Restream Proxy v2 - Railway")
+    print("  HLS Restream Proxy v3 - Railway")
     print("=" * 60)
 
     load_channels()
@@ -369,6 +412,7 @@ def main():
     for slug, ch in CHANNELS.items():
         status = "OK" if ch["m3u8_url"] else "FAIL"
         print(f"    [{status}] /channel/{slug}")
+    print("=" * 60)
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
