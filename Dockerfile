@@ -1,8 +1,8 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Sistem bağımlılıklarını yükle (curl_cffi'nin derlenmesi için gerekli)
+# curl_cffi için gerekli sistem bağımlılıkları
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ \
     libcurl4-openssl-dev libssl-dev libffi-dev \
@@ -14,4 +14,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . .
 
 EXPOSE 8080
+
+ENV PYTHONUNBUFFERED=1
+
 CMD ["python", "hls-proxy.py"]
