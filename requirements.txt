@@ -1,0 +1,4 @@
+# Ekstra bağımlılık yok - sadece Python standart kütüphanesi kullanılıyor
+# Eğer iframe içeriği almak için sorun yaşarsan:
+# cloudscraper>=1.2.71
+# curl_cffi>=0.7.0
